@@ -4,43 +4,74 @@
 pragma solidity ^0.8.0;
 
 contract BayesianOracle {
+    uint256 constant SCALE = 10**10;
+
     struct Fact {
-        uint256 priorTrue;  // Probabilità a priori (es. 7000 per 0.7)
-        uint256 currentPosterior;
-        bool hasEvidence;
+        uint256 priorTrue;
+        uint256 posteriorTrue;
+        // Memorizziamo il prodotto progressivo delle likelihood
+        uint256 currentLikelihoodTrue;
+        uint256 currentLikelihoodFalse;
+        bytes32[] evidenceIds;
     }
 
     struct EvidenceCPT {
         uint256 pTrueGivenFactTrue;
         uint256 pTrueGivenFactFalse;
+        bool isObserved;
+        bool lastValue;
     }
 
     mapping(bytes32 => Fact) public facts;
-    // Mappa: ID_Fatto => ID_Evidenza => CPT
-    mapping(bytes32 => mapping(bytes32 => EvidenceCPT)) public cpts;
-    // Mappa: ID_Fatto => Stato Evidenze ricevute
-    mapping(bytes32 => mapping(bytes32 => bool)) public evidenceObserved;
+    mapping(bytes32 => mapping(bytes32 => EvidenceCPT)) public evidenceData;
 
-    // 1. Setup: L'oracolo off-chain configura la rete
-    function setupFact(bytes32 _factId, uint256 _prior) external {
-        facts[_factId] = Fact(_prior, _prior, false);
-    }
+    event FactUpdated(bytes32 indexed factId, uint256 newPosterior);
 
-    function setupEvidence(bytes32 _factId, bytes32 _evidId, uint256 _pT_FT, uint256 _pT_FF) external {
-        cpts[_factId][_evidId] = EvidenceCPT(_pT_FT, _pT_FF);
-    }
-
-    // 2. Registrazione Evidenza (Inbound)
-    function submitEvidence(bytes32 _factId, bytes32 _evidId, bool _observed) external {
-        evidenceObserved[_factId][_evidId] = _observed;
-        updatePosterior(_factId);
-    }
-
-    // 3. Motore di Inferenza (Semplificato per 2 livelli)
-    function updatePosterior(bytes32 _factId) internal {
+    function setupFact(bytes32 _factId, uint256 _priorTrue) external {
         Fact storage f = facts[_factId];
-        // Qui andrebbe implementata la formula di Bayes basata sul polytree
-        // Esempio concettuale: P(F|E) = (P(E|F) * P(F)) / P(E)
-        // ... logica di calcolo numerico ...
+        f.priorTrue = _priorTrue;
+        f.posteriorTrue = _priorTrue;
+        // Inizializziamo i prodotti a 1 (rappresentato come SCALE)
+        f.currentLikelihoodTrue = SCALE;
+        f.currentLikelihoodFalse = SCALE;
+    }
+
+    function addEvidenceToFact(
+        bytes32 _factId, 
+        bytes32 _evidId, 
+        uint256 _pTFT, 
+        uint256 _pTFF
+    ) external {
+        evidenceData[_factId][_evidId] = EvidenceCPT(_pTFT, _pTFF, false, false);
+        facts[_factId].evidenceIds.push(_evidId);
+    }
+
+    function submitEvidence(bytes32 _factId, bytes32 _evidId, bool _value) external {
+        EvidenceCPT storage e = evidenceData[_factId][_evidId];
+        Fact storage f = facts[_factId];
+
+        require(!e.isObserved, "Evidenza gia' registrata");
+        e.isObserved = true;
+        e.lastValue = _value;
+
+        // AGGIORNAMENTO INCREMENTALE: Moltiplichiamo lo stato corrente per la nuova evidenza
+        if (_value) {
+            f.currentLikelihoodTrue = (f.currentLikelihoodTrue * e.pTrueGivenFactTrue) / SCALE;
+            f.currentLikelihoodFalse = (f.currentLikelihoodFalse * e.pTrueGivenFactFalse) / SCALE;
+        } else {
+            f.currentLikelihoodTrue = (f.currentLikelihoodTrue * (SCALE - e.pTrueGivenFactTrue)) / SCALE;
+            f.currentLikelihoodFalse = (f.currentLikelihoodFalse * (SCALE - e.pTrueGivenFactFalse)) / SCALE;
+        }
+
+        // Calcolo finale della posterior (Formula di Bayes)
+        // Num = P(F=T) * P(E|F=T)
+        uint256 num = (f.priorTrue * f.currentLikelihoodTrue) / SCALE;
+        // Den = P(F=T)*P(E|F=T) + P(F=F)*P(E|F=F)
+        uint256 priorFalse = SCALE - f.priorTrue;
+        uint256 den = num + (priorFalse * f.currentLikelihoodFalse) / SCALE;
+
+        f.posteriorTrue = (num * SCALE) / den;
+
+        emit FactUpdated(_factId, f.posteriorTrue);
     }
 }
